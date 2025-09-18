@@ -86,13 +86,14 @@ def main():
             output_filename = f"cleaned_{input_filename}.jpg"
             output_path = os.path.join(output_dir, output_filename)
             
-            # 处理图像 (保存调试输出)
+            # 处理图像 (标准模式)
             result_path = process_image(
                 model_path=model_path,
                 input_image_path=input_path,
                 output_path=output_path,
                 verbose=False,  # 减少输出信息
-                save_both=True  # 保存多尺度输出用于调试
+                save_debug=False,  # 标准模式，不保存调试文件
+                extract_stamp=True  # 使用优化的印章提取算法
             )
             
             print(f"   ✅ 成功: {os.path.basename(output_path)}")
@@ -113,10 +114,10 @@ def main():
     
     if success_count > 0:
         print("\n💡 输出文件说明:")
-        print("   - cleaned_*.jpg: 主要的印章擦除结果")
-        print("   - *_out1.jpg: 第一尺度输出 (调试用)")
-        print("   - *_out2.jpg: 第二尺度输出 (调试用)")
-        print("   - *_out3.jpg: 第三尺度输出 (调试用)")
+        print("   - cleaned_*.jpg: 印章擦除结果")
+        print("   - *_stamp.jpg: 基于模型mask提取的印章")
+        print("   - *_mask.png: 优化后的印章区域mask")
+        print("\n🔧 注意: 使用标准模式，如需调试文件请使用 --debug 参数")
     
     print("=" * 60)
 
@@ -166,7 +167,7 @@ def batch_process_with_details():
                 input_image_path=input_path,
                 output_path=output_path,
                 verbose=True,
-                save_both=True
+                save_debug=True
             )
             
             print(f"   📁 结果保存在: {sample_output_dir}")
