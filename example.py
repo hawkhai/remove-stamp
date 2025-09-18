@@ -311,15 +311,242 @@ def tensor_to_pil(tensor):
     return Image.fromarray(np_array)
 
 
-def process_image(model_path, input_image_path, output_path, verbose=True, save_debug=False, extract_stamp=True, enhance_mask=True, use_grayscale_mask=True):
+def compute_image_quality_metrics(image_tensor, original_tensor):
     """
-    处理单张图像 - 印章擦除 + 基于灰度/二值化的印章提取
+    计算图像质量指标
+    
+    Args:
+        image_tensor: 处理后的图像张量
+        original_tensor: 原始图像张量
+    
+    Returns:
+        dict: 质量指标字典
+    """
+    # 转换为numpy进行计算
+    if image_tensor.dim() == 4:
+        image_tensor = image_tensor.squeeze(0)
+    if original_tensor.dim() == 4:
+        original_tensor = original_tensor.squeeze(0)
+    
+    # 确保两个张量尺寸一致
+    if image_tensor.shape != original_tensor.shape:
+        # 将image_tensor调整到original_tensor的尺寸
+        target_size = original_tensor.shape[1:]  # (H, W)
+        image_tensor = torch.nn.functional.interpolate(
+            image_tensor.unsqueeze(0), size=target_size, mode='bilinear', align_corners=False
+        ).squeeze(0)
+    
+    img_np = image_tensor.permute(1, 2, 0).detach().cpu().numpy()
+    orig_np = original_tensor.permute(1, 2, 0).detach().cpu().numpy()
+    
+    # 确保在[0,1]范围内
+    img_np = np.clip(img_np, 0, 1)
+    orig_np = np.clip(orig_np, 0, 1)
+    
+    # 1. MSE (越小越好)
+    mse = np.mean((img_np - orig_np) ** 2)
+    
+    # 2. PSNR (越大越好)
+    if mse > 0:
+        psnr = 20 * np.log10(1.0 / np.sqrt(mse))
+    else:
+        psnr = float('inf')
+    
+    # 3. 结构相似性 (简化版SSIM)
+    def simple_ssim(x, y):
+        mu_x = np.mean(x)
+        mu_y = np.mean(y)
+        sigma_x = np.var(x)
+        sigma_y = np.var(y)
+        sigma_xy = np.mean((x - mu_x) * (y - mu_y))
+        
+        c1 = 0.01 ** 2
+        c2 = 0.03 ** 2
+        
+        ssim = ((2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2)) / \
+               ((mu_x ** 2 + mu_y ** 2 + c1) * (sigma_x + sigma_y + c2))
+        return ssim
+    
+    ssim = simple_ssim(img_np, orig_np)
+    
+    # 4. 边缘保持度 (计算梯度相似性)
+    def compute_gradient_magnitude(img):
+        gray = np.mean(img, axis=2) if len(img.shape) == 3 else img
+        grad_x = np.gradient(gray, axis=1)
+        grad_y = np.gradient(gray, axis=0)
+        return np.sqrt(grad_x**2 + grad_y**2)
+    
+    grad_orig = compute_gradient_magnitude(orig_np)
+    grad_img = compute_gradient_magnitude(img_np)
+    edge_preservation = np.corrcoef(grad_orig.flatten(), grad_img.flatten())[0, 1]
+    if np.isnan(edge_preservation):
+        edge_preservation = 0
+    
+    # 5. 颜色一致性 (LAB空间差异)
+    try:
+        orig_lab = color.rgb2lab(orig_np)
+        img_lab = color.rgb2lab(img_np)
+        color_diff = np.mean(np.sqrt(np.sum((orig_lab - img_lab) ** 2, axis=2)))
+    except:
+        color_diff = 0
+    
+    return {
+        'mse': mse,
+        'psnr': psnr,
+        'ssim': ssim,
+        'edge_preservation': edge_preservation,
+        'color_diff': color_diff,
+        'quality_score': psnr * 0.4 + ssim * 30 + edge_preservation * 20 - color_diff * 2
+    }
+
+
+def select_best_output_combination(outputs, original_tensor, masks, verbose=False):
+    """
+    从多个模型输出中选择最佳组合
+    
+    Args:
+        outputs: dict - 包含所有模型输出的字典
+        original_tensor: 原始图像张量
+        masks: dict - 包含不同mask的字典
+        verbose: 是否打印详细信息
+    
+    Returns:
+        tuple: (最佳清理图像, 最佳mask, 质量统计)
+    """
+    # 获取目标尺寸（使用原始输入的尺寸）
+    if original_tensor.dim() == 4:
+        target_size = original_tensor.shape[2:]  # (H, W)
+    else:
+        target_size = original_tensor.shape[1:]  # (H, W)
+    
+    # 将所有输出调整到相同尺寸
+    candidates = {}
+    for name, output in outputs.items():
+        if output.dim() == 4:
+            output = output.squeeze(0)
+        
+        # 调整尺寸
+        if output.shape[1:] != target_size:
+            output = torch.nn.functional.interpolate(
+                output.unsqueeze(0), size=target_size, mode='bilinear', align_corners=False
+            ).squeeze(0)
+        
+        candidates[{
+            'out1': 'scale1_output',
+            'out2': 'scale2_output', 
+            'out3': 'unet_output',
+            'g_images': 'final_refined'
+        }.get(name, name)] = output
+    
+    # 计算每个候选输出的质量指标
+    quality_results = {}
+    for name, output in candidates.items():
+        try:
+            metrics = compute_image_quality_metrics(output, original_tensor)
+            quality_results[name] = metrics
+            
+            if verbose:
+                print(f"📊 {name}: PSNR={metrics['psnr']:.2f}, SSIM={metrics['ssim']:.3f}, "
+                      f"Edge={metrics['edge_preservation']:.3f}, Quality={metrics['quality_score']:.2f}")
+        except Exception as e:
+            if verbose:
+                print(f"⚠️ {name}: 质量评估失败 - {str(e)}")
+            # 为失败的输出分配低质量分数
+            quality_results[name] = {
+                'mse': float('inf'),
+                'psnr': 0,
+                'ssim': 0,
+                'edge_preservation': 0,
+                'color_diff': float('inf'),
+                'quality_score': -1000
+            }
+    
+    # 选择质量分数最高的输出
+    best_name = max(quality_results.keys(), key=lambda x: quality_results[x]['quality_score'])
+    best_output = candidates[best_name]
+    
+    # 为最佳输出选择最合适的mask
+    best_mask = masks['mm']  # 默认使用模型生成的mask
+    
+    # 如果最佳输出不是最终精炼版本，可能需要调整mask策略
+    if best_name != 'final_refined':
+        if verbose:
+            print(f"🎯 选择了非最终输出 {best_name}，保持原始mask策略")
+    
+    return best_output, best_mask, {
+        'best_output': best_name,
+        'all_metrics': quality_results,
+        'best_metrics': quality_results[best_name]
+    }
+
+
+def create_ensemble_output(outputs, weights=None, verbose=False):
+    """
+    创建多输出的集成结果
+    
+    Args:
+        outputs: dict - 包含所有模型输出的字典
+        weights: dict - 每个输出的权重
+        verbose: 是否打印详细信息
+    
+    Returns:
+        torch.Tensor: 集成后的输出
+    """
+    if weights is None:
+        # 默认权重：最终精炼输出权重最高
+        weights = {
+            'g_images': 0.5,    # 最终精炼输出
+            'out3': 0.25,       # UNet输出
+            'out2': 0.15,       # 尺度2输出
+            'out1': 0.1         # 尺度1输出
+        }
+    
+    # 使用最终精炼输出作为目标尺寸
+    reference_output = outputs['g_images']
+    if reference_output.dim() == 4:
+        reference_output = reference_output.squeeze(0)
+    target_size = reference_output.shape
+    ensemble_result = torch.zeros_like(reference_output)
+    
+    total_weight = 0
+    for output_name, weight in weights.items():
+        if output_name in outputs:
+            output = outputs[output_name]
+            
+            # 确保维度一致
+            if output.dim() == 4:
+                output = output.squeeze(0)
+            
+            # 调整尺寸到目标大小
+            if output.shape != target_size:
+                output = torch.nn.functional.interpolate(
+                    output.unsqueeze(0), size=target_size[1:], mode='bilinear', align_corners=False
+                ).squeeze(0)
+            
+            ensemble_result += output * weight
+            total_weight += weight
+            
+            if verbose:
+                print(f"📊 集成 {output_name}: 权重={weight:.2f}, 尺寸={output.shape}")
+    
+    # 归一化
+    if total_weight > 0:
+        ensemble_result /= total_weight
+    
+    return ensemble_result
+
+
+def process_image(model_path, input_image_path, output_path, verbose=True, save_debug=False, extract_stamp=True, enhance_mask=True, use_grayscale_mask=True, use_ensemble=False, use_best_selection=True):
+    """
+    处理单张图像 - 印章擦除 + 多输出融合 + 基于灰度/二值化的印章提取
     
     Args:
         save_debug: 如果为True，保存调试输出（多尺度输出和原始模型mask）
         extract_stamp: 如果为True，提取印章和生成mask
         enhance_mask: 如果为True，进行mask质量改进
         use_grayscale_mask: 如果为True，使用灰度mask（避免锯齿）
+        use_ensemble: 如果为True，使用集成输出
+        use_best_selection: 如果为True，自动选择最佳输出
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if verbose:
@@ -354,34 +581,78 @@ def process_image(model_path, input_image_path, output_path, verbose=True, save_
         # 获取模型的所有输出
         out1, out2, out3, g_images, mm = model(input_tensor)
         
-        # 转换到CPU
-        g_image = g_images.data.cpu()
+        # 转换到CPU并组织所有输出
+        outputs = {
+            'out1': out1.data.cpu(),
+            'out2': out2.data.cpu(),
+            'out3': out3.data.cpu(),
+            'g_images': g_images.data.cpu(),
+        }
         
-        # 关键修复：在推理时，我们应该直接使用生成的图像
-        # 原始test.py中的mask混合是用于训练/测试时有ground truth的情况
-        # 在实际推理时，模型的最终输出g_images就是我们要的结果
-        result = g_image
+        masks = {
+            'mm': mm.data.cpu()
+        }
+        
+        # 选择最佳输出策略
+        if use_ensemble:
+            # 使用集成输出
+            if verbose:
+                print("🔄 使用多输出集成策略")
+            result = create_ensemble_output(outputs, verbose=verbose)
+            final_mask = masks['mm']
+            selection_stats = {'method': 'ensemble'}
+            
+        elif use_best_selection:
+            # 自动选择最佳输出
+            if verbose:
+                print("🎯 自动选择最佳输出")
+            result, final_mask, selection_stats = select_best_output_combination(
+                outputs, input_tensor.cpu(), masks, verbose=verbose
+            )
+            
+        else:
+            # 使用传统的最终精炼输出
+            if verbose:
+                print("📱 使用传统最终精炼输出")
+            result = outputs['g_images']
+            final_mask = masks['mm']
+            selection_stats = {'method': 'traditional', 'best_output': 'final_refined'}
         
         # 转换为PIL图像用于印章提取
+        # 确保result是正确的维度
+        if result.dim() == 4:
+            result = result.squeeze(0)
         cleaned_pil = tensor_to_pil(result)
         
-        # 调试模式：保存多尺度输出
+        # 调试模式：保存所有输出和质量对比
         if save_debug:
-            out1_cpu = out1.data.cpu()
-            out2_cpu = out2.data.cpu() 
-            out3_cpu = out3.data.cpu()
+            # 保存所有模型输出
+            for output_name, output_tensor in outputs.items():
+                debug_path = output_path.replace('.jpg', f'_debug_{output_name}.jpg')
+                ensure_dir(debug_path)
+                save_result(output_tensor, debug_path)
             
-            out1_path = output_path.replace('.jpg', '_debug_out1.jpg')
-            out2_path = output_path.replace('.jpg', '_debug_out2.jpg')
-            out3_path = output_path.replace('.jpg', '_debug_out3.jpg')
-            
-            ensure_dir(out1_path)
-            save_result(out1_cpu, out1_path)
-            save_result(out2_cpu, out2_path)
-            save_result(out3_cpu, out3_path)
+            # 保存质量对比报告
+            if use_best_selection and 'all_metrics' in selection_stats:
+                quality_report_path = output_path.replace('.jpg', '_quality_report.txt')
+                ensure_dir(quality_report_path)
+                
+                with open(quality_report_path, 'w', encoding='utf-8') as f:
+                    f.write("=== 多输出质量对比报告 ===\n\n")
+                    f.write(f"选择的最佳输出: {selection_stats['best_output']}\n\n")
+                    
+                    for name, metrics in selection_stats['all_metrics'].items():
+                        f.write(f"{name}:\n")
+                        f.write(f"  PSNR: {metrics['psnr']:.2f}\n")
+                        f.write(f"  SSIM: {metrics['ssim']:.3f}\n")
+                        f.write(f"  边缘保持: {metrics['edge_preservation']:.3f}\n")
+                        f.write(f"  颜色差异: {metrics['color_diff']:.2f}\n")
+                        f.write(f"  综合质量分: {metrics['quality_score']:.2f}\n\n")
             
             if verbose:
-                print(f"🔧 调试输出已保存")
+                print(f"🔧 调试输出已保存 (包含所有模型输出)")
+                if 'best_output' in selection_stats:
+                    print(f"🎯 最佳输出: {selection_stats['best_output']}")
         
         # 提取印章和生成mask
         if extract_stamp:
@@ -389,12 +660,22 @@ def process_image(model_path, input_image_path, output_path, verbose=True, save_
                 mode_str = "灰度mask" if use_grayscale_mask else "二值化mask"
                 print(f"🔍 提取印章 ({mode_str})")
             
-            # 使用印章提取算法
+            # 使用改进的印章提取算法（使用选择的最佳mask）
+            # 确保final_mask维度正确
+            if final_mask.dim() == 4:
+                final_mask = final_mask.squeeze(0)
+            
             stamp_image, mask_image, diff_stats = extract_stamp_and_mask(
-                original_pil, cleaned_pil, mm, 
+                original_pil, cleaned_pil, final_mask, 
                 enhance_mask=enhance_mask,
                 use_grayscale=use_grayscale_mask
             )
+            
+            # 添加选择策略信息到统计中
+            diff_stats.update({
+                'selection_method': selection_stats.get('method', 'unknown'),
+                'selected_output': selection_stats.get('best_output', 'unknown')
+            })
             
             # 保存必要输出：印章和mask
             stamp_path = output_path.replace('.jpg', '_stamp.jpg')
@@ -406,12 +687,20 @@ def process_image(model_path, input_image_path, output_path, verbose=True, save_
             stamp_image.save(stamp_path)
             mask_image.save(mask_path)
             
-            # 调试模式：保存原始模型mask
+            # 调试模式：保存原始模型mask和最终使用的mask
             if save_debug:
+                # 保存原始模型mask
                 model_mask_path = output_path.replace('.jpg', '_debug_model_mask.png')
                 ensure_dir(model_mask_path)
-                model_mask_vis = tensor_to_pil(mm)
+                model_mask_vis = tensor_to_pil(masks['mm'])
                 model_mask_vis.save(model_mask_path)
+                
+                # 保存最终使用的mask（如果不同）
+                if not torch.equal(final_mask, masks['mm']):
+                    final_mask_path = output_path.replace('.jpg', '_debug_final_mask.png')
+                    ensure_dir(final_mask_path)
+                    final_mask_vis = tensor_to_pil(final_mask)
+                    final_mask_vis.save(final_mask_path)
             
             if verbose:
                 print(f"📄 印章保存到: {os.path.basename(stamp_path)}")
@@ -419,8 +708,10 @@ def process_image(model_path, input_image_path, output_path, verbose=True, save_
                 print(f"📊 印章区域占比: {diff_stats['stamp_ratio']:.2%}")
                 print(f"📊 印章区域LAB差异: {diff_stats['stamp_lab_diff']:.2f}")
                 print(f"📊 整体LAB差异: {diff_stats['mean_lab_diff']:.2f}")
+                print(f"🎯 使用输出: {diff_stats.get('selected_output', 'unknown')}")
+                print(f"🔄 选择方法: {diff_stats.get('selection_method', 'unknown')}")
                 if save_debug:
-                    print(f"🔧 调试mask保存到: {os.path.basename(model_mask_path)}")
+                    print(f"🔧 调试文件已保存 (包含质量对比报告)")
     
     # 保存最终结果
     ensure_dir(output_path)
@@ -434,8 +725,8 @@ def process_image(model_path, input_image_path, output_path, verbose=True, save_
     return output_path
 
 
-def batch_process(model_path, input_dir, output_dir, extract_stamp=True):
-    """批量处理图像，包含基于模型mask的印章提取"""
+def batch_process(model_path, input_dir, output_dir, extract_stamp=True, use_ensemble=False, use_best_selection=True):
+    """批量处理图像，包含基于多输出融合的印章提取"""
     supported_formats = ('.png', '.jpg', '.jpeg', '.bmp', '.PNG', '.JPG', '.JPEG', '.BMP')
     
     # 获取图像文件
@@ -464,7 +755,9 @@ def batch_process(model_path, input_dir, output_dir, extract_stamp=True):
                 input_image_path=image_path, 
                 output_path=output_path, 
                 verbose=False,
-                extract_stamp=extract_stamp
+                extract_stamp=extract_stamp,
+                use_ensemble=use_ensemble,
+                use_best_selection=use_best_selection
             )
             success_count += 1
         except Exception as e:
@@ -477,8 +770,8 @@ def batch_process(model_path, input_dir, output_dir, extract_stamp=True):
 
 
 def quick_demo():
-    """快速演示模式 - OTSU二值化版本"""
-    print("🚀 快速演示模式 (OTSU二值化)")
+    """快速演示模式 - 多输出融合版本"""
+    print("🚀 快速演示模式 (多输出融合)")
     print("-" * 50)
     
     # 创建演示图像
@@ -487,9 +780,9 @@ def quick_demo():
     demo_image.save(demo_path)
     print(f"📝 创建演示图像: {demo_path}")
     
-    # 处理图像 - 标准模式
+    # 处理图像 - 多输出融合模式
     output_path = "demo_output_final.jpg"
-    process_image("./models/pre_model.pth", demo_path, output_path, save_debug=False)
+    process_image("./models/pre_model.pth", demo_path, output_path, save_debug=True, use_best_selection=True)
     
     print(f"\n🎉 演示完成!")
     print(f"   输入图像: {demo_path}")
@@ -497,17 +790,18 @@ def quick_demo():
     print(f"   印章图像: demo_output_final_stamp.jpg")
     print(f"   Mask图像: demo_output_final_mask.png")
     print("\n🔧 算法说明:")
-    print("   - 修复了图像预处理（移除错误归一化）")
-    print("   - 修复了推理逻辑（直接使用模型生成图像）")
-    print("   - 使用OTSU算法自动二值化模型mask")
-    print("   - 简单高效，避免过度后处理失真")
+    print("   - 充分利用模型的5个输出：out1, out2, out3, g_images, mm")
+    print("   - 自动质量评估：PSNR, SSIM, 边缘保持度, 颜色一致性")
+    print("   - 智能输出选择：自动选择质量最佳的模型输出")
+    print("   - 多输出融合：可选的加权集成策略")
+    print("   - 增强印章提取：基于最佳输出的印章分离")
     
     return demo_path, output_path
 
 
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description='印章擦除系统 (OTSU二值化印章提取)')
+    parser = argparse.ArgumentParser(description='印章擦除系统 (多输出融合印章提取)')
     parser.add_argument('--model_path', type=str, default='./models/pre_model.pth',
                         help='模型路径')
     parser.add_argument('--input_image', type=str, default=r'image\2.png', help='输入图像路径')
@@ -524,6 +818,10 @@ def main():
                         help='不进行mask质量改进后处理')
     parser.add_argument('--binary_mask', action='store_true',
                         help='使用二值化mask（默认使用灰度mask避免锯齿）')
+    parser.add_argument('--ensemble', action='store_true',
+                        help='使用多输出集成策略（加权融合所有输出）')
+    parser.add_argument('--no_auto_select', action='store_true',
+                        help='禁用自动最佳输出选择（使用传统最终输出）')
     
     args = parser.parse_args()
     
@@ -544,7 +842,8 @@ def main():
                 print(f"❌ 图像文件不存在: {args.input_image}")
                 return
             mode_desc = "二值化" if args.binary_mask else "灰度"
-            print(f"📷 单张图像处理模式 ({mode_desc}mask印章提取)")
+            strategy_desc = "集成" if args.ensemble else ("智能选择" if not args.no_auto_select else "传统")
+            print(f"📷 单张图像处理模式 ({mode_desc}mask, {strategy_desc}策略)")
             process_image(
                 model_path=args.model_path, 
                 input_image_path=args.input_image, 
@@ -552,7 +851,9 @@ def main():
                 save_debug=args.debug,
                 extract_stamp=not args.no_extract,
                 enhance_mask=not args.no_enhance_mask,
-                use_grayscale_mask=not args.binary_mask
+                use_grayscale_mask=not args.binary_mask,
+                use_ensemble=args.ensemble,
+                use_best_selection=not args.no_auto_select
             )
             
         elif args.input_dir:
@@ -560,9 +861,12 @@ def main():
             if not os.path.exists(args.input_dir):
                 print(f"❌ 目录不存在: {args.input_dir}")
                 return
-            print("📁 批量处理模式 (OTSU二值化印章提取)")
+            strategy_desc = "集成" if args.ensemble else ("智能选择" if not args.no_auto_select else "传统")
+            print(f"📁 批量处理模式 ({strategy_desc}策略印章提取)")
             batch_process(args.model_path, args.input_dir, args.output_dir, 
-                         extract_stamp=not args.no_extract)
+                         extract_stamp=not args.no_extract,
+                         use_ensemble=args.ensemble,
+                         use_best_selection=not args.no_auto_select)
             
         else:
             # 默认演示模式
@@ -570,7 +874,8 @@ def main():
             print("\n💡 使用说明:")
             print("  单张处理: python example.py --input_image image.jpg")
             print("  批量处理: python example.py --input_dir images/ --output_dir results/")
-            print("  不提取印章: python example.py --input_image image.jpg --no_extract")
+            print("  集成策略: python example.py --input_image image.jpg --ensemble")
+            print("  传统模式: python example.py --input_image image.jpg --no_auto_select")
             print("  调试模式: python example.py --input_image image.jpg --debug")
             print("  二值化mask: python example.py --input_image image.jpg --binary_mask")
             
