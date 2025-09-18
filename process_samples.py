@@ -86,13 +86,13 @@ def main():
             output_filename = f"cleaned_{input_filename}.jpg"
             output_path = os.path.join(output_dir, output_filename)
             
-            # 处理图像 (标准模式)
+            # 处理图像 (带调试mask模式)
             result_path = process_image(
                 model_path=model_path,
                 input_image_path=input_path,
                 output_path=output_path,
                 verbose=False,  # 减少输出信息
-                save_debug=False,  # 标准模式，不保存调试文件
+                save_debug=True,  # 保存调试文件，包括调试mask
                 extract_stamp=True  # 使用优化的印章提取算法
             )
             
@@ -117,14 +117,18 @@ def main():
         print("   - cleaned_*.jpg: 印章擦除结果")
         print("   - *_stamp.jpg: 基于模型mask提取的印章")
         print("   - *_mask.png: 优化后的印章区域mask")
-        print("\n🔧 注意: 使用标准模式，如需调试文件请使用 --debug 参数")
+        print("   - *_debug_model_mask.png: 原始模型mask")
+        print("   - *_debug_final_mask.png: 最终使用的mask")
+        print("   - *_debug_*.jpg: 所有模型输出")
+        print("   - *_quality_report.txt: 质量对比报告")
+        print("\n🔧 注意: 已启用调试模式，保存所有调试文件")
     
     print("=" * 60)
 
 
 def batch_process_with_details():
-    """带详细信息的批量处理函数"""
-    print("🔍 详细处理模式")
+    """带详细信息的批量处理函数 (为每个样本创建子目录)"""
+    print("🔍 详细处理模式 (子目录模式)")
     print("-" * 40)
     
     # 样本文件信息

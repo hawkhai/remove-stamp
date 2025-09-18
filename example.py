@@ -695,12 +695,17 @@ def process_image(model_path, input_image_path, output_path, verbose=True, save_
                 model_mask_vis = tensor_to_pil(masks['mm'])
                 model_mask_vis.save(model_mask_path)
                 
-                # 保存最终使用的mask（如果不同）
-                if not torch.equal(final_mask, masks['mm']):
-                    final_mask_path = output_path.replace('.jpg', '_debug_final_mask.png')
-                    ensure_dir(final_mask_path)
-                    final_mask_vis = tensor_to_pil(final_mask)
-                    final_mask_vis.save(final_mask_path)
+                # 总是保存最终使用的mask（即使相同也保存，便于调试对比）
+                final_mask_path = output_path.replace('.jpg', '_debug_final_mask.png')
+                ensure_dir(final_mask_path)
+                final_mask_vis = tensor_to_pil(final_mask)
+                final_mask_vis.save(final_mask_path)
+                
+                if verbose:
+                    if torch.equal(final_mask, masks['mm']):
+                        print(f"🔧 最终mask与模型mask相同")
+                    else:
+                        print(f"🔧 最终mask与模型mask不同")
             
             if verbose:
                 print(f"📄 印章保存到: {os.path.basename(stamp_path)}")
@@ -725,7 +730,7 @@ def process_image(model_path, input_image_path, output_path, verbose=True, save_
     return output_path
 
 
-def batch_process(model_path, input_dir, output_dir, extract_stamp=True, use_ensemble=False, use_best_selection=True):
+def batch_process(model_path, input_dir, output_dir, extract_stamp=True, use_ensemble=False, use_best_selection=True, save_debug_masks=False):
     """批量处理图像，包含基于多输出融合的印章提取"""
     supported_formats = ('.png', '.jpg', '.jpeg', '.bmp', '.PNG', '.JPG', '.JPEG', '.BMP')
     
@@ -755,6 +760,7 @@ def batch_process(model_path, input_dir, output_dir, extract_stamp=True, use_ens
                 input_image_path=image_path, 
                 output_path=output_path, 
                 verbose=False,
+                save_debug=save_debug_masks,
                 extract_stamp=extract_stamp,
                 use_ensemble=use_ensemble,
                 use_best_selection=use_best_selection
@@ -822,6 +828,8 @@ def main():
                         help='使用多输出集成策略（加权融合所有输出）')
     parser.add_argument('--no_auto_select', action='store_true',
                         help='禁用自动最佳输出选择（使用传统最终输出）')
+    parser.add_argument('--batch_debug_masks', action='store_true',
+                        help='批量处理时保存调试mask文件')
     
     args = parser.parse_args()
     
@@ -866,7 +874,8 @@ def main():
             batch_process(args.model_path, args.input_dir, args.output_dir, 
                          extract_stamp=not args.no_extract,
                          use_ensemble=args.ensemble,
-                         use_best_selection=not args.no_auto_select)
+                         use_best_selection=not args.no_auto_select,
+                         save_debug_masks=args.batch_debug_masks)
             
         else:
             # 默认演示模式
@@ -874,6 +883,7 @@ def main():
             print("\n💡 使用说明:")
             print("  单张处理: python example.py --input_image image.jpg")
             print("  批量处理: python example.py --input_dir images/ --output_dir results/")
+            print("  批量调试mask: python example.py --input_dir images/ --batch_debug_masks")
             print("  集成策略: python example.py --input_image image.jpg --ensemble")
             print("  传统模式: python example.py --input_image image.jpg --no_auto_select")
             print("  调试模式: python example.py --input_image image.jpg --debug")
