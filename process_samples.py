@@ -26,16 +26,12 @@ def main():
         return
     
     # 定义样本文件路径
-    sample_files = [
-        r"I:\pdfai_serv\classify\seal_extract\tmp_work\separated\102_extracted_RGB.png",
-        r"I:\pdfai_serv\classify\seal_extract\tmp_work\separated\103_extracted_RGB.png", 
-        r"I:\pdfai_serv\classify\seal_extract\tmp_work\separated\10_extracted_RGB.png",
-        r"I:\pdfai_serv\classify\seal_extract\tmp_work\separated\2_extracted_RGB.png",
-        r"I:\pdfai_serv\classify\seal_extract\tmp_work\separated\3_extracted_RGB.png",
-        r"I:\pdfai_serv\classify\seal_extract\tmp_work\separated\4_extracted_RGB.png",
-        r"I:\pdfai_serv\classify\seal_extract\tmp_work\separated\52_extracted_RGB.png",
-        r"I:\pdfai_serv\classify\seal_extract\tmp_work\separated\6_extracted_RGB.png"
-    ]
+    rootdir = r"D:\kSource\pdfai\pdfai_serv\classify\seal_extract\extracted_figures"
+    sample_files= []
+    for idir in os.listdir(rootdir):
+        imgfile = os.path.join(rootdir, idir)
+        if os.path.splitext(imgfile)[-1] in (".png", ".jpg", ".jpeg"):
+            sample_files.append(imgfile)
     
     # 配置参数
     model_path = "./models/pre_model.pth"
