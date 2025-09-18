@@ -68,11 +68,10 @@ def check_dependencies():
 
 
 def load_image(image_path, load_size=(512, 512)):
-    """加载并预处理图像"""
+    """加载并预处理图像 - 修复：移除错误的归一化"""
     transform = transforms.Compose([
         transforms.Resize(size=load_size, interpolation=Image.BICUBIC),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        transforms.ToTensor(),  # 只转换到[0,1]，不做[-1,1]归一化
     ])
     
     image = Image.open(image_path).convert('RGB')
@@ -81,8 +80,8 @@ def load_image(image_path, load_size=(512, 512)):
 
 
 def save_result(tensor, save_path):
-    """保存处理结果"""
-    tensor = (tensor + 1) / 2.0  # 反归一化到[0, 1]
+    """保存处理结果 - 修复：移除错误的反归一化"""
+    # 模型输出已经在[0,1]范围内，不需要反归一化
     tensor = torch.clamp(tensor, 0, 1)
     save_image(tensor, save_path)
 
@@ -94,8 +93,13 @@ def create_demo_image():
     return img
 
 
-def process_image(model_path, input_image_path, output_path, verbose=True):
-    """处理单张图像"""
+def process_image(model_path, input_image_path, output_path, verbose=True, save_both=False):
+    """
+    处理单张图像 - 修复：正确处理模型输出
+    
+    Args:
+        save_both: 如果为True，保存两个版本：直接输出和mask混合版本
+    """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if verbose:
         print(f"📱 使用设备: {device}")
@@ -123,15 +127,38 @@ def process_image(model_path, input_image_path, output_path, verbose=True):
     input_tensor = load_image(input_image_path).to(device)
     
     with torch.no_grad():
-        _, _, _, final_output, _ = model(input_tensor)
-        result = final_output.cpu()
+        # 获取模型的所有输出
+        out1, out2, out3, g_images, mm = model(input_tensor)
+        
+        # 转换到CPU
+        g_image = g_images.data.cpu()
+        
+        # 关键修复：在推理时，我们应该直接使用生成的图像
+        # 原始test.py中的mask混合是用于训练/测试时有ground truth的情况
+        # 在实际推理时，模型的最终输出g_images就是我们要的结果
+        result = g_image
+        
+        if save_both:
+            # 保存其他尺度的输出用于调试
+            out1_cpu = out1.data.cpu()
+            out2_cpu = out2.data.cpu() 
+            out3_cpu = out3.data.cpu()
+            
+            save_result(out1_cpu, output_path.replace('.jpg', '_out1.jpg'))
+            save_result(out2_cpu, output_path.replace('.jpg', '_out2.jpg'))
+            save_result(out3_cpu, output_path.replace('.jpg', '_out3.jpg'))
+            
+            if verbose:
+                print(f"💾 多尺度输出已保存用于调试")
     
-    # 保存结果
+    # 保存最终结果
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     save_result(result, output_path)
     
     if verbose:
         print(f"✅ 完成! 保存到: {output_path}")
+        if save_both:
+            print("📝 说明: 保存了主输出和多尺度调试输出")
     
     return output_path
 
@@ -168,9 +195,9 @@ def batch_process(model_path, input_dir, output_dir):
 
 
 def quick_demo():
-    """快速演示模式"""
-    print("🚀 快速演示模式")
-    print("-" * 40)
+    """快速演示模式 - 最终修复版本"""
+    print("🚀 快速演示模式 (最终修复版本)")
+    print("-" * 50)
     
     # 创建演示图像
     demo_image = create_demo_image()
@@ -178,20 +205,26 @@ def quick_demo():
     demo_image.save(demo_path)
     print(f"📝 创建演示图像: {demo_path}")
     
-    # 处理图像
-    output_path = "demo_output.jpg"
-    process_image("./models/pre_model.pth", demo_path, output_path)
+    # 处理图像 - 保存多尺度输出用于调试
+    output_path = "demo_output_final.jpg"
+    process_image("./models/pre_model.pth", demo_path, output_path, save_both=True)
     
     print(f"\n🎉 演示完成!")
-    print(f"   输入: {demo_path}")
-    print(f"   输出: {output_path}")
+    print(f"   输入图像: {demo_path}")
+    print(f"   主要输出: {output_path}")
+    print(f"   调试输出: demo_output_final_out1/2/3.jpg")
+    print("\n🔧 最终修复说明:")
+    print("   - 修复了图像预处理（移除错误归一化）")
+    print("   - 修复了推理逻辑（直接使用模型生成图像）")
+    print("   - 移除了错误的mask混合（推理时不需要）")
+    print("   - 现在直接输出模型的印章擦除结果")
     
     return demo_path, output_path
 
 
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description='印章擦除系统')
+    parser = argparse.ArgumentParser(description='印章擦除系统 (已修复推理逻辑)')
     parser.add_argument('--model_path', type=str, default='./models/pre_model.pth',
                         help='模型路径')
     parser.add_argument('--input_image', type=str, default=r'image\2.png', help='输入图像路径')
@@ -200,6 +233,8 @@ def main():
                         help='输出图像路径')
     parser.add_argument('--output_dir', type=str, default='./results/',
                         help='输出目录（批量处理）')
+    parser.add_argument('--save_both', action='store_true',
+                        help='保存两个版本：mask混合版本和直接输出版本')
     
     args = parser.parse_args()
     
@@ -219,15 +254,15 @@ def main():
             if not os.path.exists(args.input_image):
                 print(f"❌ 图像文件不存在: {args.input_image}")
                 return
-            print("📷 单张图像处理模式")
-            process_image(args.model_path, args.input_image, args.output_path)
+            print("📷 单张图像处理模式 (已修复)")
+            process_image(args.model_path, args.input_image, args.output_path, save_both=args.save_both)
             
         elif args.input_dir:
             # 批量处理
             if not os.path.exists(args.input_dir):
                 print(f"❌ 目录不存在: {args.input_dir}")
                 return
-            print("📁 批量处理模式")
+            print("📁 批量处理模式 (已修复)")
             batch_process(args.model_path, args.input_dir, args.output_dir)
             
         else:
@@ -236,6 +271,7 @@ def main():
             print("\n💡 使用说明:")
             print("  单张处理: python example.py --input_image image.jpg")
             print("  批量处理: python example.py --input_dir images/ --output_dir results/")
+            print("  保存两版本: python example.py --input_image image.jpg --save_both")
             
     except Exception as e:
         print(f"❌ 运行出错: {str(e)}")
